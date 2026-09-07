@@ -1,0 +1,135 @@
+name: Gemini Multi-Site Generator
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate or Update Site with Gemini
+        id: generate
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          python - << 'EOF'
+          import os
+          import re
+          import json
+          import urllib.request
+
+          issue_title = os.environ.get("ISSUE_TITLE", "")
+          issue_body = os.environ.get("ISSUE_BODY", "") or ""
+          api_key = os.environ.get("GEMINI_API_KEY", "")
+
+          # Projektnamen aus eckigen Klammern extrahieren: [projektname]
+          match = re.search(r"\[([a-zA-Z0-9_-]+)\]", issue_title)
+          if not match:
+              print("Ungültiges Format. Titel muss z.B. '[projektname] Prompt' enthalten.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("valid=false\n")
+              exit(0)
+
+          project_slug = match.group(1).lower()
+          prompt_text = issue_title.replace(f"[{match.group(1)}]", "").strip()
+          if issue_body.strip():
+              prompt_text += f"\nZusatzdetails:\n{issue_body.strip()}"
+
+          os.makedirs(project_slug, exist_ok=True)
+          file_path = os.path.join(project_slug, "index.html")
+
+          existing_code = ""
+          if os.path.exists(file_path):
+              with open(file_path, "r", encoding="utf-8") as f:
+                  existing_code = f.read()
+
+          system_instruction = (
+              "Du bist ein erfahrener Frontend-Entwickler. Erstelle eine vollständige, moderne, "
+              "responsive Webanwendung in einer EINZIGEN Datei (Standard-HTML mit eingebetteten "
+              "<style>- und <script>-Tags). "
+              "Antworte AUSSCHLIESSLICH mit dem puren HTML-Code. Verwende keine Markdown-Backticks "
+              "(kein ```html), keine Begrüßungen und keine Erklärungen."
+          )
+
+          if existing_code:
+              user_prompt = (
+                  f"Aktualisiere den folgenden Code basierend auf diesem Änderungswunsch:\n"
+                  f"Wunsch: {prompt_text}\n\n"
+                  f"Bestehender Code:\n{existing_code}"
+              )
+          else:
+              user_prompt = f"Erstelle eine neue Website basierend auf folgender Anforderung:\n{prompt_text}"
+
+          url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=){api_key}"
+          payload = {
+              "contents": [{"parts": [{"text": user_prompt}]}],
+              "systemInstruction": {"parts": [{"text": system_instruction}]},
+              "generationConfig": {"temperature": 0.2}
+          }
+
+          req = urllib.request.Request(
+              url,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={"Content-Type": "application/json"}
+          )
+
+          with urllib.request.urlopen(req) as response:
+              data = json.loads(response.read().decode("utf-8"))
+              raw_code = data["candidates"][0]["content"]["parts"][0]["text"]
+
+          # Markdown-Artefakte bereinigen, falls vorhanden
+          clean_code = re.sub(r"^```(?:html)?\s*", "", raw_code.strip(), flags=re.IGNORECASE)
+          clean_code = re.sub(r"\s*```$", "", clean_code.strip())
+
+          with open(file_path, "w", encoding="utf-8") as f:
+              f.write(clean_code)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"valid=true\n")
+              f.write(f"project_slug={project_slug}\n")
+          EOF
+
+      - name: Commit and Push Changes
+        if: steps.generate.outputs.valid == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.generate.outputs.project_slug }}/index.html"
+          if git diff --staged --quiet; then
+            echo "Keine Änderungen generiert."
+          else
+            git commit -m "Site Update: ${{ steps.generate.outputs.project_slug }} via Gemini"
+            git push
+          fi
+
+      - name: Comment and Close Issue
+        if: steps.generate.outputs.valid == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SLUG: ${{ steps.generate.outputs.project_slug }}
+        run: |
+          SITE_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/$SLUG/"
+          gh issue comment "${{ github.event.issue.number }}" --body "🚀 **Website bereitgestellt!**"$'\n\n'"Deine Seite ist live unter: $SITE_URL"
+          gh issue close "${{ github.event.issue.number }}"
+
+      - name: Notify on Invalid Syntax
+        if: steps.generate.outputs.valid == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --body "⚠️ **Formatfehler:** Der Titel muss das Format \`[projektname] Deine Beschreibung\` haben."
